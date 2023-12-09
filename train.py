@@ -55,7 +55,8 @@ dropout = 0.0
 # adamw optimizer
 gradient_accumulation_steps = 4  # used to simulate larger batch sizes
 learning_rate = 5e-4  # max learning rate
-max_iters = 100000  # total number of training iterations
+#max_iters = 100000  # total number of training iterations
+max_iters = 10000  # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -65,7 +66,8 @@ decay_lr = True  # whether to decay the learning rate
 warmup_iters = 1000  # how many steps to warm up for
 # system
 device = "cuda"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-dtype = "bfloat16"  # float32|bfloat16|float16
+# dtype = "bfloat16"  # float32|bfloat16|float16
+dtype = "float32"  # float32|bfloat16|float16
 compile = True  # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [
