@@ -29,6 +29,7 @@ from torch.distributed import destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from tinystories import Task
+from export import model_export
 
 # -----------------------------------------------------------------------------
 # I/O
@@ -46,10 +47,13 @@ wandb_run_name = "run" + datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
 # data
 batch_size = 128  # if gradient_accumulation_steps > 1, this is the micro-batch size
 max_seq_len = 256
+vocab_source = "llama2" # llama2|custom; use Lllama 2 vocab from Meta, or custom trained
+vocab_size = 32000 # the Llama 2 tokenizer has 32K tokens
 # model
 dim = 288
 n_layers = 6
 n_heads = 6
+n_kv_heads = 6
 multiple_of = 32
 dropout = 0.0
 # adamw optimizer
@@ -82,6 +86,10 @@ config = {k: globals()[k] for k in config_keys}  # will be useful for logging
 # fixing some hyperparams to sensible defaults
 lr_decay_iters = max_iters  # should be ~= max_iters per Chinchilla
 min_lr = 0.0  # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+
+# validating checks
+assert vocab_source in ["llama2", "custom"]
+assert vocab_source == "custom" or vocab_size == 32000, "The vocab from Meta has 32K tokens"
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run?
@@ -127,6 +135,8 @@ iter_batches = partial(
     Task.iter_batches,
     batch_size=batch_size,
     max_seq_len=max_seq_len,
+    vocab_size=vocab_size,
+    vocab_source=vocab_source,
     device=device,
     num_workers=0,
 )
@@ -140,11 +150,11 @@ model_args = dict(
     dim=dim,
     n_layers=n_layers,
     n_heads=n_heads,
-    n_kv_heads=n_heads,
-    vocab_size=32000,
+    n_kv_heads=n_kv_heads,
+    vocab_size=vocab_size,
     multiple_of=multiple_of,
     max_seq_len=max_seq_len,
-    #dropout=dropout,
+    dropout=dropout,
 )  # start with model_args from command line
 if init_from == "scratch":
     # init a new model from scratch
@@ -181,7 +191,7 @@ scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
 
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
-if init_from == "resume":
+if init_from == "resume" and "optimizer" in checkpoint:
     optimizer.load_state_dict(checkpoint["optimizer"])
 checkpoint = None  # free up memory
 
@@ -193,6 +203,10 @@ if compile:
 
 # wrap model into DDP container
 if ddp:
+    # Ignore the `freqs_cis` buffer so that DDP does not broadcast it at
+    # construction time since NCCL does not support `ComplexFloat`
+    prefix = "_orig_mod." if compile else ""
+    model._ddp_params_and_buffers_to_ignore = {prefix + "freqs_cis"}
     model = DDP(model, device_ids=[ddp_local_rank])
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
@@ -201,12 +215,13 @@ def estimate_loss():
     out = {}
     model.eval()
     for split in ["train", "val"]:
-        batch_iter = iter_batches(split)
+        batch_iter = iter_batches(split=split)
         losses = torch.zeros(eval_iters)  # keep on CPU
         for k in range(eval_iters):
             X, Y = next(batch_iter)
             with ctx:
-                logits, loss = model(X, Y)
+                logits = model(X, Y)
+                loss = raw_model.last_loss
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -232,7 +247,7 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
-train_batch_iter = iter_batches("train")
+train_batch_iter = iter_batches(split="train")
 X, Y = next(train_batch_iter)  # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0  # number of iterations in the lifetime of this process
@@ -258,7 +273,7 @@ while True:
                         "loss/val": losses["val"],
                         "lr": lr,
                         "mfu": running_mfu * 100,  # convert to percentage
-                    }
+                    }, step = iter_num
                 )
             except Exception as e:
                 print(f"logging to wandb failed: {e}")
@@ -275,7 +290,7 @@ while True:
                 }
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, "ckpt.pt"))
-                raw_model.export(os.path.join(out_dir, "model.bin"))
+                model_export(raw_model, os.path.join(out_dir, "model.bin"), version=0)
     if iter_num == 0 and eval_only:
         break
 
@@ -289,7 +304,8 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = micro_step == gradient_accumulation_steps - 1
         with ctx:
-            logits, loss = model(X, Y)
+            logits = model(X, Y)
+            loss = raw_model.last_loss
             loss = loss / gradient_accumulation_steps
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = next(train_batch_iter)
